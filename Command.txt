@@ -1,0 +1,111 @@
+#### COMMAND FOR THE EXECUTION ####
+
+##	To satrt we performed the sorting and indexing of the bam files, from which we was able to
+##	extract informations as Coverega and Depth
+
+samtools sort Control.bam > Control.sorted.bam
+samtools sort Tumor.bam > Tumor.sorted.bam
+
+samtools index Control.sorted.bam
+samtools index Tumor.sorted.bam
+
+samtools bedcov ../Captured_Regions.bed Control.processed.bam > ../BEDCov.Control.txt
+samtools bedcov ../Captured_Regions.bed Tumor.processed.bam > ../BEDCov.Tumor.txt
+
+samtools depth -b ../Captured_Regions.bed Control.processed.bam > ../BEDDepth.Control.txt
+samtools depth -b ../Captured_Regions.bed Tumor.processed.bam > ../BEDDepth.Tumor.txt
+
+##	Here we are realigning the read, because the algorithm may prefer to introduce
+##	mis-matches instead of indels. Therefore I could find a very huge number of mis-matches
+##	and bias further analysis 
+
+java -jar ../Tools/GenomeAnalysisTK.jar -T RealignerTargetCreator -R ../Annotations/human_g1k_v37.fasta -I Control.sorted.bam -o realigner.control.intervals -L Captured_Regions.bed
+
+java -jar ../Tools/GenomeAnalysisTK.jar -T RealignerTargetCreator -R ../Annotations/human_g1k_v37.fasta -I Tumor.sorted.bam -o realigner.tumor.intervals -L Captured_Regions.bed
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T IndelRealigner -R ../../Annotations/human_g1k_v37.fasta -I Control.sorted.bam -targetIntervals realigner.control.intervals -o ../realignment/Control.sorted.realigned.bam -L ../Captured_Regions.bed
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T IndelRealigner -R ../../Annotations/human_g1k_v37.fasta -I Tumor.sorted.bam -targetIntervals realigner.tumor.intervals -o ../realignment/Tumor.sorted.realigned.bam -L ../Captured_Regions.bed
+
+##	To check if the realignment was performe we can check how many reads
+##	was actuallt realigned
+##	OC = original cigar to see how many sequences were realigned
+
+samtools view Control.sorted.realigned.bam | grep OC | wc -l
+samtools view Tumor.sorted.realigned.bam | grep OC | wc -l
+
+samtools view Control.sorted.realigned.bam | grep OC | less
+samtools view Tumorl.sorted.realigned.bam | grep OC | less
+
+##	We continue performing recalibration to adjust and control the quality scores 
+##	of the bases
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T BaseRecalibrator -R ../../Annotations/human_g1k_v37.fasta -I Control.sorted.realigned.bam -knownSites ../../Annotations/hapmap_3.3.b37.vcf -BQSR recal.control.table -o ../recalibration/after_recal.control.table -L ../Captured_Regions.bed
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T BaseRecalibrator -R ../../Annotations/human_g1k_v37.fasta -I Tumor.sorted.realigned.bam -knownSites ../../Annotations/hapmap_3.3.b37.vcf -BQSR recal.tumor.table -o ../recalibration/after_recal.tumor.table -L ../Captured_Regions.bed
+
+##	From now on the files will be named Control-Tumor.processed.bam for convenience
+##	As follow are rapresented the command to revome the duplicated reads that
+##	may be have been produce due to tecnical errors during the sequencing
+
+java -jar ../../Tools/picard.jar MarkDuplicates I=Control.sorted.realigned.recalibrated.bam O=../duplicated/Control.processed.bam REMOVE_DUPLICATES=true TMP_DIR=/tmp METRICS_FILE=Control.sorted.realigned.recalibrated.picard.log ASSUME_SORTED=true
+
+java -jar ../../Tools/picard.jar MarkDuplicates I=Tumor.sorted.realigned.recalibrated.bam O=../duplicated/Tumor.processed.bam REMOVE_DUPLICATES=true TMP_DIR=/tmp METRICS_FILE=Tumor.sorted.realigned.recalibrated.picard.log ASSUME_SORTED=true 
+
+samtools index Control.processed.bam
+samtools index Tumor.processed.bam
+
+samtools flagstat Control.processed.bam 
+samtools flagstat Tumor.processed.bam 
+
+----	variant calling		----
+ 
+##	With the use of VARSCAN and SNPEff we performed the variant calling and
+##	annotation
+
+samtools mpileup -B -f ../../Annotations/human_g1k_v37.fasta ../duplicated/Control.processed.bam > Control.pileup
+
+java -jar ../../Tools/VarScan.v2.3.9.jar mpileup2snp Control.pileup --p-value 0.01 --output-vcf 1 > Control.VARSCAN.vcf
+
+vcftools --max-meanDP 200 --min-meanDP 8 --remove-indels --vcf Control.VARSCAN.vcf --out Control.VARSCAN --recode --recode-INFO-all 
+
+java -Xmx4g -jar ../../Tools/snpEff/snpEff.jar -v hg19kg Control.VARSCAN.recode.vcf -s Control.VARSCAN.recode.ann.html > Control.VARSCAN.recode.ann.vcf
+
+----	somatic variant calling		----
+
+##	Again with VARSCAN we performed the somatic variant calling, in this case
+##	VARSCAN use the Fisher exact test to call the variant positions
+
+samtools mpileup -B -f ../../Annotations/human_g1k_v37.fasta ../duplicated/Tumor.processed.bam > Tumor.pileup
+
+java -jar ../../Tools/VarScan.v2.3.9.jar somatic ../snp_variant/Control.pileup Tumor.pileup --output-snp somatic.pm --output-indel somatic.indel --output-vcf 1
+
+java -jar ../../Tools/VarScan.v2.3.9.jar somatic ../snp_variant/Control.pileup Tumor.pileup --output-snp somatic.pm --output-indel somatic.indel
+
+vcftools --max-meanDP 200 --min-meanDP 8 --remove-indels --vcf Tumor.VARSCAN.vcf --out Tumor.VARSCAN --recode --recode-INFO-all
+
+java -Xmx4g -jar ../../Tools/snpEff/snpEff.jar -v hg19kg somatic.pm.vcf -s somatic.pm.vcf.html > somatic.pm.ann.vcf
+
+----	copy number	----
+
+##	Somatic copy-number is a key point to analyse the Tumor samples
+
+samtools mpileup -q 1 -f ../../Annotations/human_g1k_v37.fasta ../duplicated/Control.processed.bam ../duplicated/Tumor.processed.bam | java -jar ../../Tools/VarScan.v2.3.9.jar copynumber --output-file SCNA --mpileup 1
+
+java -jar ../../Tools/VarScan.v2.3.9.jar copyCaller SCNA.copynumber --output-file SCNA.copynumber.called
+
+##	This file can be loaded on IGV to visualize it and combine in formation
+##	on geniomics reagion, annotation and about the reds allignement with the BAM file.
+
+Rscript CBS.R
+
+----	putity ploidy	-----
+
+##	To proper make inference on the retrived results, there is the need
+##	to estimate purity and ploidy
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T ASEReadCounter -R ../../Annotations/human_g1k_v37.fasta -o Control.csv -I ../duplicated/Control.processed.bam -sites ../snp_variant/Control.VARSCAN.vcf -U ALLOW_N_CIGAR_READS -minDepth 20 --minMappingQuality 20 --minBaseQuality 20
+
+java -jar ../../Tools/GenomeAnalysisTK.jar -T ASEReadCounter -R ../../Annotations/human_g1k_v37.fasta -o Tumor.csv -I ../duplicated/Tumor.processed.bam -sites ../snp_variant/Control.VARSCAN.vcf -U ALLOW_N_CIGAR_READS -minDepth 20 --minMappingQuality 20 --minBaseQuality 20
+
+##	We now have proced with the Clonet.R script
